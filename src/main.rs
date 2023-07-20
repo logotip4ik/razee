@@ -1,6 +1,7 @@
 use async_recursion::async_recursion;
 use futures::future::join_all;
-use reqwest::StatusCode;
+use reqwest::{Client, StatusCode};
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, env, fs, io::BufReader};
@@ -10,6 +11,12 @@ mod logger;
 type DependenciesMap = HashMap<String, String>;
 type Deps = Arc<Mutex<Vec<Dep>>>;
 type ProcessedDeps = Arc<Mutex<HashMap<String, Dep>>>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RegistryPackage {
+    name: String,
+    time: HashMap<String, String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Package {
@@ -67,60 +74,72 @@ fn parse_root_package() -> Package {
     return package;
 }
 
-fn normalize_version(version: String) -> String {
-    let normalized_version: String;
-
-    if version.contains("||") {
-        normalized_version = normalize_version(
-            version
-                .split("||")
-                .last()
-                .expect(format!("invalid version {}", version).as_str())
-                .trim()
-                .to_string(),
-        );
-    } else if version.starts_with("^") || version.starts_with("~") {
-        normalized_version = version[1..].into();
-    } else if version == "*" {
-        normalized_version = "latest".into();
-    } else if version.len() == 1 {
-        normalized_version = format!("{}.0.0", version);
-    } else {
-        normalized_version = version;
-    }
-
-    return normalized_version;
-}
-
 async fn fetch_dep(dep: &Dep) -> Dependency {
-    let version: String = normalize_version(dep.version.clone());
+    let client = Client::new();
 
-    let dep_url: String = format!("{}/{}/{}", REGISTRY_URL, dep.name, version);
-
-    let res = reqwest::get(dep_url)
+    let url = REGISTRY_URL.to_owned() + "/" + dep.name.as_str();
+    let package = client
+        .get(url)
+        .header("User-Agent", "Razee (Node Package Manger in Rust)")
+        .send()
         .await
-        .expect("cannot fetch dependency");
+        .expect("probably no internet");
 
-    match res.status() {
-        StatusCode::OK => {
-            let body = res.text().await.expect("cannot read dependency body");
-        
-            let dependency = serde_json::from_str(body.as_str())
-                .expect(format!("cannot parse dependency {} on {}\n", dep.name, dep.version).as_str());
-        
-            return dependency;
-        },
-        _ => {
-            panic!("fetch error with {}:{} resolved version {}", dep.name, dep.version, version);
+    assert_eq!(package.status(), StatusCode::OK);
+
+    let body = package.text().await.expect("cannot read package deps");
+    let package: RegistryPackage = serde_json::from_str(body.as_str())
+        .expect(format!("cannot parse dependency {} on {}\n", dep.name, dep.version).as_str());
+    let mut dep_versions = package
+        .time
+        .keys()
+        .filter(|version| !version.contains("-") && version.contains("."))
+        .map(|version| Version::parse(version).expect("cannot parse version"));
+
+    let requested_version =
+        VersionReq::parse(&dep.version).expect("cannot parse requested version");
+
+    let resolved_version: Version;
+
+    if let Some(version) = dep_versions.find(|version| requested_version.matches(version)) {
+        resolved_version = version;
+    } else {
+        let versions: Vec<Version> = dep_versions.collect();
+
+        if versions.len() == 1 {
+            resolved_version = versions.get(0).expect("there is no versions available").clone();
+        } else {
+            resolved_version = versions
+                .iter()
+                .max()
+                .unwrap_or(versions.get(0).expect("there is no versions available"))
+                .clone();
         }
     }
+
+    let dep_url: String = format!("{}/{}/{}", REGISTRY_URL, dep.name, resolved_version);
+    let res = client
+        .get(dep_url)
+        .header("User-Agent", "Razee (Node Package Manger in Rust)")
+        .send()
+        .await
+        .expect("probably no internet");
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = res.text().await.expect("cannot read dependency body");
+
+    let dependency = serde_json::from_str(body.as_str())
+        .expect(format!("cannot parse dependency {} on {}\n", dep.name, dep.version).as_str());
+
+    return dependency;
 }
 
 // fn mark_deps()
 
 #[async_recursion]
 async fn process_deps(queue: Deps, processed_deps: ProcessedDeps) {
-    let mut tasks = vec![];
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
 
     loop {
         let queue = queue.clone();
@@ -130,13 +149,13 @@ async fn process_deps(queue: Deps, processed_deps: ProcessedDeps) {
 
         if let Some(dep) = dep {
             tasks.push(tokio::spawn(async move {
+                logger::log_fetching(&dep.name);
                 let fetched_dep = fetch_dep(&dep).await;
 
                 {
                     let mut processed_deps = processed_deps.lock().unwrap();
-    
+
                     processed_deps.insert(dep.name.clone(), dep);
-                    logger::log_processed(processed_deps.len());
                 }
 
                 if let Some(normal_deps) = fetched_dep.dependencies {

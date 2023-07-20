@@ -653,6 +653,7 @@ dependencies = [
  "async-recursion",
  "futures",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "tokio",
@@ -767,6 +768,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0293b4b29daaf487284529cc2f5675b8e57c61f70167ba415a463651fd6a918"
 
 [[package]]
 name = "serde"
