@@ -43,16 +43,9 @@ struct Dependency {
 }
 
 #[derive(Debug, Clone)]
-enum DepType {
-    Dev,
-    Normal,
-}
-
-#[derive(Debug, Clone)]
 struct Dep {
     name: String,
     version: String,
-    r#type: DepType,
 }
 
 const REGISTRY_URL: &str = "https://registry.npmjs.org";
@@ -74,6 +67,33 @@ fn parse_root_package() -> Package {
     return package;
 }
 
+fn resolve_version(package: &RegistryPackage, requested_version: &VersionReq) -> Version {
+    let mut dep_versions = package
+        .time
+        .keys()
+        .filter(|version| !version.contains("-") && version.contains("."))
+        .map(|version| Version::parse(version).expect("cannot parse version"));
+
+    if let Some(version) = dep_versions.find(|version| requested_version.matches(version)) {
+        return version;
+    } else {
+        let versions: Vec<Version> = dep_versions.collect();
+
+        if versions.len() == 1 {
+            return versions
+                .get(0)
+                .expect("there is no versions available")
+                .clone();
+        } else {
+            return versions
+                .iter()
+                .max()
+                .unwrap_or(versions.get(0).expect("there is no versions available"))
+                .clone();
+        }
+    }
+}
+
 async fn fetch_dep(dep: &Dep) -> Dependency {
     let client = Client::new();
 
@@ -90,32 +110,11 @@ async fn fetch_dep(dep: &Dep) -> Dependency {
     let body = package.text().await.expect("cannot read package deps");
     let package: RegistryPackage = serde_json::from_str(body.as_str())
         .expect(format!("cannot parse dependency {} on {}\n", dep.name, dep.version).as_str());
-    let mut dep_versions = package
-        .time
-        .keys()
-        .filter(|version| !version.contains("-") && version.contains("."))
-        .map(|version| Version::parse(version).expect("cannot parse version"));
 
     let requested_version =
         VersionReq::parse(&dep.version).expect("cannot parse requested version");
 
-    let resolved_version: Version;
-
-    if let Some(version) = dep_versions.find(|version| requested_version.matches(version)) {
-        resolved_version = version;
-    } else {
-        let versions: Vec<Version> = dep_versions.collect();
-
-        if versions.len() == 1 {
-            resolved_version = versions.get(0).expect("there is no versions available").clone();
-        } else {
-            resolved_version = versions
-                .iter()
-                .max()
-                .unwrap_or(versions.get(0).expect("there is no versions available"))
-                .clone();
-        }
-    }
+    let resolved_version = resolve_version(&package, &requested_version);
 
     let dep_url: String = format!("{}/{}/{}", REGISTRY_URL, dep.name, resolved_version);
     let res = client
@@ -135,101 +134,80 @@ async fn fetch_dep(dep: &Dep) -> Dependency {
     return dependency;
 }
 
-// fn mark_deps()
-
 #[async_recursion]
-async fn process_deps(queue: Deps, processed_deps: ProcessedDeps) {
-    let mut tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
+async fn process_dep(dep: Dep, processed_deps: ProcessedDeps) {
+    let package = fetch_dep(&dep).await;
 
-    loop {
-        let queue = queue.clone();
-        let processed_deps = processed_deps.clone();
+    {
+        let mut processed = processed_deps.lock().unwrap();
 
-        let dep = { queue.lock().unwrap().pop() };
+        logger::log_processed(&dep.name);
 
-        if let Some(dep) = dep {
-            tasks.push(tokio::spawn(async move {
-                logger::log_fetching(&dep.name);
-                let fetched_dep = fetch_dep(&dep).await;
+        processed.insert(dep.name.clone(), dep);
+    }
 
-                {
-                    let mut processed_deps = processed_deps.lock().unwrap();
+    let mut needs_processing = vec![];
 
-                    processed_deps.insert(dep.name.clone(), dep);
-                }
+    if let Some(deps) = package.dependencies {
+        let processed = processed_deps.lock().unwrap();
 
-                if let Some(normal_deps) = fetched_dep.dependencies {
-                    let processed_deps = processed_deps.lock().unwrap();
-
-                    for (k, v) in normal_deps.iter() {
-                        if !processed_deps.contains_key(k) {
-                            let dep = Dep {
-                                name: k.clone(),
-                                version: v.clone(),
-                                r#type: DepType::Normal,
-                            };
-
-                            queue.lock().unwrap().push(dep);
-                        }
-                    }
-                }
-            }))
-        } else {
-            break;
+        for (k, v) in deps.iter() {
+            if !processed.contains_key(k) {
+                needs_processing.push(Dep {
+                    name: k.to_owned(),
+                    version: v.to_owned(),
+                });
+            }
         }
     }
 
-    join_all(tasks).await;
+    join_all(needs_processing.iter().map(|dep| {
+        let dep = dep.to_owned();
+        let processed_deps = processed_deps.clone();
 
-    let queue_len = queue.lock().unwrap().len();
-
-    if queue_len > 0 {
-        process_deps(queue, processed_deps).await;
-    }
+        tokio::spawn(async move {
+            process_dep(dep, processed_deps).await;
+        })
+    }))
+    .await;
 }
 
 #[tokio::main]
 async fn main() {
     let package = parse_root_package();
 
-    let queue: Deps = Arc::new(Mutex::new(Vec::new()));
+    let mut needs_processing = vec![];
     let processed_deps: ProcessedDeps = Arc::new(Mutex::new(HashMap::new()));
 
     if let Some(normal_deps) = package.dependencies {
-        let mut queue = queue.lock().unwrap();
-
         normal_deps.into_iter().for_each(|(name, version)| {
-            let dep = Dep {
-                name,
-                version,
-                r#type: DepType::Normal,
-            };
+            let dep = Dep { name, version };
 
-            queue.push(dep);
+            needs_processing.push(dep);
         });
     }
 
     if let Some(dev_deps) = package.dev_dependencies {
-        let mut queue = queue.lock().unwrap();
-
         dev_deps.into_iter().for_each(|(name, version)| {
-            let dep = Dep {
-                name,
-                version,
-                r#type: DepType::Dev,
-            };
+            let dep = Dep { name, version };
 
-            queue.push(dep);
+            needs_processing.push(dep);
         });
     }
 
-    process_deps(queue, processed_deps.clone()).await;
+    join_all(needs_processing.iter().map(|dep| {
+        let dep = dep.to_owned();
+        let processed_deps = processed_deps.clone();
+
+        tokio::spawn(async move {
+            process_dep(dep, processed_deps).await;
+        })
+    }))
+    .await;
+
+    // process_deps(queue, processed_deps.clone()).await;
 
     let processed = processed_deps.lock().unwrap();
 
     println!("Fetched {} packages", processed.len())
-
-    // for (_, dep) in processed.iter() {
-    //     println!("fetched {}: {}", dep.name, dep.version);
-    // }
 }
