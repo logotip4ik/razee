@@ -108,22 +108,15 @@ async fn fetch_dep(dep: &Dep) -> Dependency {
 
     let url: String = format!("{REGISTRY_URL}/{}", dep.name);
     // TODO: use json feature of reqwest
-    let package = client
+    let package: RegistryPackage = client
         .get(&url)
         .header("User-Agent", "Razee (Node Package Manger in Rust)")
         .send()
         .await
-        .expect("probably no internet");
-
-    if package.status() != StatusCode::OK {
-        println!("failed to fetch {}\n", url);
-    }
-
-    assert_eq!(package.status(), StatusCode::OK);
-
-    let body = package.text().await.expect("cannot read package deps");
-    let package: RegistryPackage = serde_json::from_str(body.as_str())
-        .expect(format!("cannot parse dependency {} on {}\n", dep.name, dep.version).as_str());
+        .expect("probably no internet")
+        .json()
+        .await
+        .expect("cannot parse dependency");
 
     let requested_version = Range::parse(&dep.version).expect(
         format!(
@@ -136,23 +129,15 @@ async fn fetch_dep(dep: &Dep) -> Dependency {
     let resolved_version = resolve_version(&package, &requested_version);
 
     let url: String = format!("{REGISTRY_URL}/{}/{resolved_version}", dep.name);
-    let res = client
+    let dependency: Dependency = client
         .get(&url)
         .header("User-Agent", "Razee (Node Package Manger in Rust)")
         .send()
         .await
-        .expect("probably no internet");
-
-    if res.status() != StatusCode::OK {
-        println!("failed to fetch {}\n", url);
-    }
-
-    assert_eq!(res.status(), StatusCode::OK);
-
-    let body = res.text().await.expect("cannot read dependency body");
-
-    let dependency = serde_json::from_str(body.as_str())
-        .expect(format!("cannot parse dependency {} on {}\n", dep.name, dep.version).as_str());
+        .expect("probably no internet")
+        .json()
+        .await
+        .unwrap();
 
     return dependency;
 }
