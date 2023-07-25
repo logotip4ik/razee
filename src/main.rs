@@ -1,15 +1,16 @@
 use async_recursion::async_recursion;
 use futures::future::join_all;
 use reqwest::{Client, StatusCode};
-use semver::{Version, VersionReq};
+// use semver::{Version, VersionReq};
+use node_semver::{Version, Range};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{collections::HashMap, env, fs, io::BufReader};
+use tokio::sync::Mutex;
 
 mod logger;
 
 type DependenciesMap = HashMap<String, String>;
-type Deps = Arc<Mutex<Vec<Dep>>>;
 type ProcessedDeps = Arc<Mutex<HashMap<String, Dep>>>;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,14 +68,14 @@ fn parse_root_package() -> Package {
     return package;
 }
 
-fn resolve_version(package: &RegistryPackage, requested_version: &VersionReq) -> Version {
+fn resolve_version(package: &RegistryPackage, requested_version: &Range) -> Version {
     let mut dep_versions = package
         .time
         .keys()
         .filter(|version| !version.contains("-") && version.contains("."))
         .map(|version| Version::parse(version).expect("cannot parse version"));
 
-    if let Some(version) = dep_versions.find(|version| requested_version.matches(version)) {
+    if let Some(version) = dep_versions.find(|version| requested_version.satisfies(version)) {
         return version;
     } else {
         let versions: Vec<Version> = dep_versions.collect();
@@ -97,13 +98,17 @@ fn resolve_version(package: &RegistryPackage, requested_version: &VersionReq) ->
 async fn fetch_dep(dep: &Dep) -> Dependency {
     let client = Client::new();
 
-    let url = REGISTRY_URL.to_owned() + "/" + dep.name.as_str();
+    let url: String = format!("{REGISTRY_URL}/{}", dep.name);
     let package = client
-        .get(url)
+        .get(&url)
         .header("User-Agent", "Razee (Node Package Manger in Rust)")
         .send()
         .await
         .expect("probably no internet");
+
+    if package.status() != StatusCode::OK {
+        println!("failed to fetch {}\n", url);
+    }
 
     assert_eq!(package.status(), StatusCode::OK);
 
@@ -111,18 +116,27 @@ async fn fetch_dep(dep: &Dep) -> Dependency {
     let package: RegistryPackage = serde_json::from_str(body.as_str())
         .expect(format!("cannot parse dependency {} on {}\n", dep.name, dep.version).as_str());
 
-    let requested_version =
-        VersionReq::parse(&dep.version).expect("cannot parse requested version");
+    let requested_version = Range::parse(&dep.version).expect(
+        format!(
+            "cannot parse requested version: {}:{}",
+            package.name, dep.version
+        )
+        .as_str(),
+    );
 
     let resolved_version = resolve_version(&package, &requested_version);
 
-    let dep_url: String = format!("{}/{}/{}", REGISTRY_URL, dep.name, resolved_version);
+    let url: String = format!("{REGISTRY_URL}/{}/{resolved_version}", dep.name);
     let res = client
-        .get(dep_url)
+        .get(&url)
         .header("User-Agent", "Razee (Node Package Manger in Rust)")
         .send()
         .await
         .expect("probably no internet");
+
+    if res.status() != StatusCode::OK {
+        println!("failed to fetch {}\n", url);
+    }
 
     assert_eq!(res.status(), StatusCode::OK);
 
@@ -135,21 +149,21 @@ async fn fetch_dep(dep: &Dep) -> Dependency {
 }
 
 #[async_recursion]
-async fn process_dep(dep: Dep, processed_deps: ProcessedDeps) {
+async fn process_dep(dep: &Dep, processed_deps: ProcessedDeps) {
     let package = fetch_dep(&dep).await;
 
     {
-        let mut processed = processed_deps.lock().unwrap();
+        let mut processed = processed_deps.lock().await;
 
         logger::log_processed(&dep.name);
 
-        processed.insert(dep.name.clone(), dep);
+        processed.insert(dep.name.clone(), dep.clone());
     }
 
     let mut needs_processing = vec![];
 
     if let Some(deps) = package.dependencies {
-        let processed = processed_deps.lock().unwrap();
+        let processed = processed_deps.lock().await;
 
         for (k, v) in deps.iter() {
             if !processed.contains_key(k) {
@@ -161,14 +175,12 @@ async fn process_dep(dep: Dep, processed_deps: ProcessedDeps) {
         }
     }
 
-    join_all(needs_processing.iter().map(|dep| {
-        let dep = dep.to_owned();
-        let processed_deps = processed_deps.clone();
-
-        tokio::spawn(async move {
-            process_dep(dep, processed_deps).await;
-        })
-    }))
+    join_all(
+        needs_processing
+            .iter()
+            .map(|dep| process_dep(dep, processed_deps.clone()))
+            .collect::<Vec<_>>(),
+    )
     .await;
 }
 
@@ -195,19 +207,16 @@ async fn main() {
         });
     }
 
-    join_all(needs_processing.iter().map(|dep| {
-        let dep = dep.to_owned();
-        let processed_deps = processed_deps.clone();
-
-        tokio::spawn(async move {
-            process_dep(dep, processed_deps).await;
-        })
-    }))
+    join_all(
+        needs_processing
+            .iter()
+            .map(|dep| process_dep(dep, processed_deps.clone()))
+            .collect::<Vec<_>>(),
+    )
     .await;
 
-    // process_deps(queue, processed_deps.clone()).await;
+    let processed = processed_deps.lock().await;
 
-    let processed = processed_deps.lock().unwrap();
-
-    println!("Fetched {} packages", processed.len())
+    println!("Fetched {} packages", processed.len());
+    println!("{:?}", processed);
 }
