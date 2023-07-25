@@ -2,10 +2,9 @@ use async_recursion::async_recursion;
 use flate2::read::GzDecoder;
 use futures::future::join_all;
 use node_semver::{Range, Version};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env, fs,
     io::{BufReader, Cursor},
     path::Path,
@@ -15,12 +14,15 @@ use tar::Archive;
 use tokio::sync::Mutex;
 use walkdir::WalkDir;
 
+use http_client::HttpClient;
+
+mod http_client;
 mod logger;
 
 type DependenciesMap = HashMap<String, String>;
 type ProcessedDeps = Arc<Mutex<HashMap<String, Dep>>>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RegistryPackage {
     name: String,
     time: HashMap<String, String>,
@@ -113,23 +115,12 @@ fn resolve_version(package: &RegistryPackage, requested_version: &Range) -> Vers
     }
 }
 
-async fn fetch_dep(dep: &Dep) -> Dependency {
-    let client = Client::new();
-
-    let url: String = format!("{REGISTRY_URL}/{}", dep.name);
-    // TODO: use json feature of reqwest
-    let package: RegistryPackage = client
-        .get(&url)
-        .header("User-Agent", "Razee (Node Package Manger in Rust)")
-        .send()
-        .await
-        .expect("probably no internet")
-        .json()
-        .await
-        .expect("cannot parse dependency");
+async fn fetch_dep(dep: &Dep, client: Arc<HttpClient>) -> Dependency {
+    let package = client.fetch_package(&dep).await;
 
     let normalized_version;
 
+    // TODO: export this into function
     if dep.version.starts_with("npm") {
         let package_or_version = dep.version.strip_prefix("npm:").unwrap();
 
@@ -153,20 +144,16 @@ async fn fetch_dep(dep: &Dep) -> Dependency {
     let resolved_version = resolve_version(&package, &requested_version);
 
     let url: String = format!("{REGISTRY_URL}/{}/{resolved_version}", dep.name);
-    let dependency: Dependency = client
-        .get(&url)
-        .header("User-Agent", "Razee (Node Package Manger in Rust)")
-        .send()
-        .await
-        .expect("probably no internet")
-        .json()
-        .await
-        .unwrap();
+    let dependency = client.fetch_dependency(&url).await;
 
-    return dependency;
+    return dependency.to_owned();
 }
 
-async fn fetch_tarball(dep_name: &String, dep_dist: &DependencyDist) {
+async fn download_tarball(
+    dep_name: &String,
+    dep_dist: &DependencyDist,
+    client: Arc<HttpClient>,
+) {
     let dep_dir = format!("{NODE_MODULES}/{dep_name}");
 
     if Path::new(&dep_dir).exists() {
@@ -187,17 +174,7 @@ async fn fetch_tarball(dep_name: &String, dep_dist: &DependencyDist) {
         }
     }
 
-    let client = Client::new();
-
-    let tarball_bytes = client
-        .get(&dep_dist.tarball)
-        .header("User-Agent", "Razee (Node Package Manger in Rust)")
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
+    let tarball_bytes = client.fetch_tarball(dep_dist).await;
 
     let tarball_cursor = Cursor::new(tarball_bytes);
     let tarball = GzDecoder::new(tarball_cursor);
@@ -250,10 +227,10 @@ async fn fetch_tarball(dep_name: &String, dep_dist: &DependencyDist) {
     }
 }
 
-#[async_recursion]
-async fn process_dep(dep: &Dep, processed_deps: ProcessedDeps) {
-    let package = fetch_dep(&dep).await;
-    let tarball_promise = fetch_tarball(&package.name, &package.dist);
+#[async_recursion(?Send)]
+async fn process_dep(dep: &Dep, processed_deps: ProcessedDeps, client: Arc<HttpClient>) {
+    let package = fetch_dep(&dep, client.clone()).await;
+    let tarball_promise = download_tarball(&package.name, &package.dist, client.clone());
 
     {
         let mut processed = processed_deps.lock().await;
@@ -283,7 +260,7 @@ async fn process_dep(dep: &Dep, processed_deps: ProcessedDeps) {
     join_all(
         needs_processing
             .iter()
-            .map(|dep| process_dep(dep, processed_deps.clone()))
+            .map(|dep| process_dep(dep, processed_deps.clone(), client.clone()))
             .collect::<Vec<_>>(),
     )
     .await;
@@ -314,10 +291,13 @@ async fn main() {
 
     println!();
 
+    // let http_client = Arc::new(Mutex::new(HttpClient::new()));
+    let mut http_client = Arc::new(HttpClient::new());
+
     join_all(
         needs_processing
             .iter()
-            .map(|dep| process_dep(dep, processed_deps.clone()))
+            .map(|dep| process_dep(dep, processed_deps.clone(), http_client.clone()))
             .collect::<Vec<_>>(),
     )
     .await;
