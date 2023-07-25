@@ -2,18 +2,18 @@ use async_recursion::async_recursion;
 use flate2::read::GzDecoder;
 use futures::future::join_all;
 use node_semver::{Range, Version};
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{BufReader, Cursor},
     path::Path,
+    sync::Arc,
 };
 use tar::Archive;
 use tokio::sync::Mutex;
+use walkdir::WalkDir;
 
 mod logger;
 
@@ -38,6 +38,8 @@ struct Package {
 struct DependencyDist {
     integrity: String,
     tarball: String,
+    #[serde(rename = "fileCount")]
+    file_count: Option<i16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,13 +79,17 @@ fn parse_root_package() -> Package {
 }
 
 fn resolve_version(package: &RegistryPackage, requested_version: &Range) -> Version {
-    let mut dep_versions = package
+    let dep_versions = package
         .time
         .keys()
-        .filter(|version| !version.contains("-") && version.contains("."))
-        .map(|version| Version::parse(version).expect("cannot parse version"));
+        .filter(|version| version.contains("."))
+        .map(|v| Version::parse(v).unwrap());
 
-    if let Some(version) = dep_versions.find(|version| requested_version.satisfies(version)) {
+    let satisfied_version = dep_versions
+        .clone()
+        .find(|version| requested_version.satisfies(version));
+
+    if let Some(version) = satisfied_version {
         return version;
     } else {
         let versions: Vec<Version> = dep_versions.collect();
@@ -97,7 +103,11 @@ fn resolve_version(package: &RegistryPackage, requested_version: &Range) -> Vers
             return versions
                 .iter()
                 .max()
-                .unwrap_or(versions.get(0).expect("there is no versions available"))
+                .unwrap_or({
+                    let msg = format!("no versions {:?}\n{:?}", package, versions);
+
+                    versions.get(0).expect(msg.as_str())
+                })
                 .clone();
         }
     }
@@ -118,7 +128,21 @@ async fn fetch_dep(dep: &Dep) -> Dependency {
         .await
         .expect("cannot parse dependency");
 
-    let requested_version = Range::parse(&dep.version).expect(
+    let normalized_version;
+
+    if dep.version.starts_with("npm") {
+        let package_or_version = dep.version.strip_prefix("npm:").unwrap();
+
+        if package_or_version.contains("@") {
+            normalized_version = package_or_version.split("@").last().unwrap();
+        } else {
+            normalized_version = package_or_version;
+        }
+    } else {
+        normalized_version = dep.version.as_str();
+    }
+
+    let requested_version = Range::parse(normalized_version).expect(
         format!(
             "cannot parse requested version: {}:{}",
             package.name, dep.version
@@ -142,18 +166,31 @@ async fn fetch_dep(dep: &Dep) -> Dependency {
     return dependency;
 }
 
-async fn fetch_tarball(dep_name: &String, dep_version: &String, dep_tarball: &String) {
+async fn fetch_tarball(dep_name: &String, dep_dist: &DependencyDist) {
     let dep_dir = format!("{NODE_MODULES}/{dep_name}");
-    let dep_dir_package = format!("{dep_dir}/package.json");
 
-    if Path::new(&dep_dir_package).exists() {
-        return;
+    if Path::new(&dep_dir).exists() {
+        if let Some(file_count) = dep_dist.file_count {
+            let mut file_counter = 0;
+
+            for entry in WalkDir::new(&dep_dir) {
+                let entry = entry.unwrap();
+
+                if entry.file_type().is_file() {
+                    file_counter += 1;
+                }
+            }
+
+            if file_counter == file_count {
+                return;
+            }
+        }
     }
 
     let client = Client::new();
 
     let tarball_bytes = client
-        .get(dep_tarball)
+        .get(&dep_dist.tarball)
         .header("User-Agent", "Razee (Node Package Manger in Rust)")
         .send()
         .await
@@ -169,13 +206,35 @@ async fn fetch_tarball(dep_name: &String, dep_version: &String, dep_tarball: &St
 
     for entry in archive.entries().unwrap() {
         if let Ok(mut entry) = entry {
-            let path = entry
+            let mut path = entry
                 .path()
                 .unwrap()
                 .to_str()
                 .unwrap()
                 .replace("package", &dep_dir)
                 .to_owned();
+
+            // Transforms @types/estree   estree/readme
+            //              dep_name        entry ? why not package ? idk
+            if !path.starts_with(&NODE_MODULES) {
+                path = format!("{dep_dir}/{path}");
+
+                let mut path_parts = path.split("/");
+
+                let mut new_path = vec![];
+
+                new_path.push(path_parts.next().unwrap().to_string());
+
+                for part in path_parts {
+                    let prev_part = new_path.last().unwrap();
+
+                    if !part.eq(prev_part) {
+                        new_path.push(part.to_string());
+                    }
+                }
+
+                path = new_path.join("/");
+            }
 
             let mut folders: Vec<&str> = path.split("/").collect();
             folders.pop();
@@ -184,7 +243,9 @@ async fn fetch_tarball(dep_name: &String, dep_version: &String, dep_tarball: &St
                 fs::create_dir_all(folders.join("/")).unwrap();
             }
 
-            entry.unpack(&path).unwrap();
+            if !Path::new(&path).exists() {
+                entry.unpack(&path).unwrap();
+            }
         }
     }
 }
@@ -192,7 +253,7 @@ async fn fetch_tarball(dep_name: &String, dep_version: &String, dep_tarball: &St
 #[async_recursion]
 async fn process_dep(dep: &Dep, processed_deps: ProcessedDeps) {
     let package = fetch_dep(&dep).await;
-    let tarball_promise = fetch_tarball(&package.name, &package.version, &package.dist.tarball);
+    let tarball_promise = fetch_tarball(&package.name, &package.dist);
 
     {
         let mut processed = processed_deps.lock().await;
@@ -251,6 +312,8 @@ async fn main() {
         });
     }
 
+    println!();
+
     join_all(
         needs_processing
             .iter()
@@ -262,5 +325,5 @@ async fn main() {
     let processed = processed_deps.lock().await;
 
     println!("Fetched {} packages", processed.len());
-    println!("{:?}", processed);
+    // println!("{:?}", processed);
 }

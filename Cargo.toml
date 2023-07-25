@@ -17,3 +17,4 @@ bytes = "1.4.0"
 tokio-util = { version = "0.7.8", features = ["io"] }
 tar = "0.4.39"
 flate2 = { version = "1.0.26", features = ["zlib-ng"], default-features = false }
+walkdir = "2.3.3"
