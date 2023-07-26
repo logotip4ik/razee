@@ -32,7 +32,7 @@ impl HttpClient {
     }
 
     /// fetches specific package version for gathering tarball url and other dependencies
-    pub async fn fetch_dependency(&self, url: &String) -> &Dependency {
+    pub(crate) async fn fetch_dependency(&self, url: &String) -> &Dependency {
         if let Some(dependency) = self.dependency_cache.get(url) {
             return dependency;
         }
@@ -54,7 +54,7 @@ impl HttpClient {
     }
 
     /// fetches package info to resolve version
-    pub async fn fetch_package(&self, dep: &Dep) -> &RegistryPackage {
+    pub(crate) async fn fetch_package(&self, dep: &Dep) -> &RegistryPackage {
         let url = format!("{REGISTRY_URL}/{}", dep.name);
         
         if let Some(package) = self.package_cache.get(&url) {
@@ -78,7 +78,7 @@ impl HttpClient {
     }
 
     /// fetches tarball for package
-    pub async fn fetch_tarball(&self, dist: &DependencyDist) -> &Bytes {
+    pub(crate) async fn fetch_tarball(&self, dist: &DependencyDist) -> &Bytes {
         if let Some(tarball) = self.tarball_cache.get(&dist.tarball) {
             return tarball;
         }
