@@ -11,8 +11,8 @@ use std::{
     sync::Arc,
 };
 use tar::Archive;
-use tokio::sync::Mutex;
 use walkdir::WalkDir;
+use elsa::FrozenMap;
 
 use http_client::HttpClient;
 
@@ -20,7 +20,7 @@ mod http_client;
 mod logger;
 
 type DependenciesMap = HashMap<String, String>;
-type ProcessedDeps = Arc<Mutex<HashMap<String, Dep>>>;
+type ProcessedDeps = Arc<FrozenMap<String, Box<Dep>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RegistryPackage {
@@ -230,23 +230,17 @@ async fn download_tarball(
 #[async_recursion(?Send)]
 async fn process_dep(dep: &Dep, processed_deps: ProcessedDeps, client: Arc<HttpClient>) {
     let package = fetch_dep(&dep, client.clone()).await;
-    let tarball_promise = download_tarball(&package.name, &package.dist, client.clone());
+    let tarball_future = download_tarball(&package.name, &package.dist, client.clone());
 
-    {
-        let mut processed = processed_deps.lock().await;
+    logger::log_processed(&dep.name);
 
-        logger::log_processed(&dep.name);
-
-        processed.insert(dep.name.clone(), dep.clone());
-    }
+    processed_deps.insert(dep.name.clone(), Box::new(dep.to_owned()));
 
     let mut needs_processing = vec![];
 
     if let Some(deps) = package.dependencies {
-        let processed = processed_deps.lock().await;
-
         for (k, v) in deps.iter() {
-            if !processed.contains_key(k) {
+            if processed_deps.get(k).is_none() {
                 needs_processing.push(Dep {
                     name: k.to_owned(),
                     version: v.to_owned(),
@@ -255,7 +249,7 @@ async fn process_dep(dep: &Dep, processed_deps: ProcessedDeps, client: Arc<HttpC
         }
     }
 
-    tarball_promise.await;
+    tarball_future.await;
 
     join_all(
         needs_processing
@@ -271,7 +265,7 @@ async fn main() {
     let package = parse_root_package();
 
     let mut needs_processing = vec![];
-    let processed_deps: ProcessedDeps = Arc::new(Mutex::new(HashMap::new()));
+    let processed_deps: ProcessedDeps = Arc::new(FrozenMap::new());
 
     if let Some(normal_deps) = package.dependencies {
         normal_deps.into_iter().for_each(|(name, version)| {
@@ -292,7 +286,7 @@ async fn main() {
     println!();
 
     // let http_client = Arc::new(Mutex::new(HttpClient::new()));
-    let mut http_client = Arc::new(HttpClient::new());
+    let http_client = Arc::new(HttpClient::new());
 
     join_all(
         needs_processing
@@ -302,8 +296,6 @@ async fn main() {
     )
     .await;
 
-    let processed = processed_deps.lock().await;
-
-    println!("Fetched {} packages", processed.len());
+    println!("Fetched {} packages", processed_deps.len());
     // println!("{:?}", processed);
 }
