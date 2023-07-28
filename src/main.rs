@@ -60,7 +60,6 @@ struct Dep {
     version: String,
 }
 
-const REGISTRY_URL: &str = "https://registry.npmjs.org";
 const NODE_MODULES: &str = "node_modules";
 
 fn parse_root_package() -> Package {
@@ -143,8 +142,7 @@ async fn fetch_dep(dep: &Dep, client: Arc<HttpClient>) -> Dependency {
 
     let resolved_version = resolve_version(&package, &requested_version);
 
-    let url: String = format!("{REGISTRY_URL}/{}/{resolved_version}", dep.name);
-    let dependency = client.fetch_dependency(&url).await;
+    let dependency = client.fetch_dependency(&dep.name, &resolved_version).await;
 
     return dependency.to_owned();
 }

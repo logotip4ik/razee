@@ -1,9 +1,11 @@
 use bytes::Bytes;
 use elsa::FrozenMap;
+use node_semver::Version;
+use reqwest::StatusCode;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 
-use crate::{Dependency, DependencyDist, RegistryPackage, Dep};
+use crate::{Dep, Dependency, DependencyDist, RegistryPackage};
 
 const REGISTRY_URL: &str = "http://registry.npmjs.org";
 
@@ -22,7 +24,7 @@ impl HttpClient {
             .build();
 
         // let client = reqwest::Client::new();
-        
+
         return HttpClient {
             client,
             tarball_cache: FrozenMap::new(),
@@ -32,21 +34,43 @@ impl HttpClient {
     }
 
     /// fetches specific package version for gathering tarball url and other dependencies
-    pub(crate) async fn fetch_dependency(&self, url: &String) -> &Dependency {
-        if let Some(dependency) = self.dependency_cache.get(url) {
+    pub(crate) async fn fetch_dependency(&self, dep_name: &String, dep_version: &Version) -> &Dependency {
+        let url = format!("{REGISTRY_URL}/{}/{}", dep_name, dep_version);
+
+        if let Some(dependency) = self.dependency_cache.get(&url) {
             return dependency;
         }
 
-        let dependency: Dependency = self
+        let dependency_res = self
             .client
-            .get(url)
+            .get(&url)
             .header("User-Agent", "Razee (Node Package Manger in Rust)")
             .send()
             .await
-            .expect("probably no internet")
-            .json()
-            .await
-            .unwrap();
+            .expect("probably no internet");
+
+        let dependency;
+
+        match dependency_res.status() {
+            StatusCode::OK => {
+                dependency = dependency_res.json().await.unwrap();
+            }
+            _ => {
+                println!("{}:{}\n\n", dep_name, dep_version);
+                let latest_url = format!("{REGISTRY_URL}/{}/{}", dep_name, "latest");
+
+                dependency = self
+                    .client
+                    .get(&latest_url)
+                    .header("User-Agent", "Razee (Node Package Manger in Rust)")
+                    .send()
+                    .await
+                    .expect("probably no internet")
+                    .json()
+                    .await
+                    .unwrap();
+            }
+        }
 
         return self
             .dependency_cache
@@ -56,7 +80,7 @@ impl HttpClient {
     /// fetches package info to resolve version
     pub(crate) async fn fetch_package(&self, dep: &Dep) -> &RegistryPackage {
         let url = format!("{REGISTRY_URL}/{}", dep.name);
-        
+
         if let Some(package) = self.package_cache.get(&url) {
             return package;
         }
